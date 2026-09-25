@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
 from app.database import get_db
-from app.models import OperationData, RobotModel, Scene, Skill, Annotation
+from app.models import OperationData, RobotModel, Scene, Skill, Annotation, IdempotencyRecord
 from app.schemas.operation import (
     OperationDataCreate, OperationDataUpdate, OperationDataResponse,
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
@@ -178,6 +178,10 @@ def delete_operation_data(operation_id: int, db: Session = Depends(get_db)):
     operation = db.query(OperationData).filter(OperationData.id == operation_id).first()
     if not operation:
         raise HTTPException(status_code=404, detail="作业数据不存在")
+    # 幂等记录以外键引用业务数据，需同事务一并删除，避免悬挂引用
+    db.query(IdempotencyRecord).filter(
+        IdempotencyRecord.operation_id == operation_id
+    ).delete(synchronize_session=False)
     db.delete(operation)
     db.commit()
     return {"message": "删除成功"}
