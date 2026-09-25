@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -77,6 +77,30 @@ class OperationData(Base):
     skill = relationship("Skill", back_populates="operations")
     annotation = relationship("Annotation", back_populates="operation_data", uselist=False, cascade="all, delete-orphan")
     dataset_items = relationship("DatasetItem", back_populates="operation_data", cascade="all, delete-orphan")
+
+
+class IdempotencyRecord(Base):
+    """接入幂等记录：业务键 + 载荷指纹 + 首次请求保存的完整结果。"""
+
+    __tablename__ = "idempotency_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scope = Column(String(50), nullable=False, index=True)
+    idempotency_key = Column(String(200), nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+
+    response_body = Column(JSON, nullable=False)
+    operation_data_id = Column(Integer, ForeignKey("operation_data.id"), nullable=True, index=True)
+
+    hit_count = Column(Integer, nullable=False, default=0)
+    conflict_count = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("scope", "idempotency_key", name="uq_idempotency_scope_key"),
+    )
 
 
 class Annotation(Base):

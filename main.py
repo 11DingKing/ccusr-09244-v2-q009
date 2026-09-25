@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import engine, Base
-from app.routers import common, operation, dataset, analytics
+from app.routers import common, operation, dataset, analytics, idempotency
 
 
 def create_tables():
@@ -33,6 +33,7 @@ app = FastAPI(
 ### 作业数据采集
 - 按机型、场景、作业技能归类入库
 - 动作轨迹、感知记录、抓取成败数据采集
+- 支持调用方业务键的幂等接入：重试重放原结果、载荷不同判冲突、过期键按策略回收
 
 ### 人工标注
 - 成功/失败标注
@@ -85,6 +86,7 @@ app.include_router(common.router, prefix=api_prefix)
 app.include_router(operation.router, prefix=api_prefix)
 app.include_router(dataset.router, prefix=api_prefix)
 app.include_router(analytics.router, prefix=api_prefix)
+app.include_router(idempotency.router, prefix=api_prefix)
 
 
 @app.get("/", tags=["首页"])

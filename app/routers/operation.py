@@ -1,8 +1,12 @@
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Callable, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, and_
 
+from app.config import settings
 from app.database import get_db
 from app.models import OperationData, RobotModel, Scene, Skill, Annotation
 from app.schemas.operation import (
@@ -10,8 +14,129 @@ from app.schemas.operation import (
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
     AnnotationCreate, AnnotationUpdate, AnnotationResponse
 )
+from app.services import idempotency as idem
 
 router = APIRouter()
+
+
+def _idempotency_policy() -> idem.IdempotencyPolicy:
+    return idem.IdempotencyPolicy(
+        ttl=timedelta(hours=settings.IDEMPOTENCY_TTL_HOURS)
+    ).validate()
+
+
+def _single_ref_errors(db: Session, data: OperationDataCreate) -> List[str]:
+    errors = []
+    if not db.query(RobotModel).filter(RobotModel.id == data.robot_model_id).first():
+        errors.append("机型不存在")
+    if not db.query(Scene).filter(Scene.id == data.scene_id).first():
+        errors.append("场景不存在")
+    if not db.query(Skill).filter(Skill.id == data.skill_id).first():
+        errors.append("技能不存在")
+    return errors
+
+
+def _batch_ref_errors(data: OperationDataCreate, valid_robot_models, valid_scenes, valid_skills) -> List[str]:
+    errors = []
+    if data.robot_model_id not in valid_robot_models:
+        errors.append(f"机型ID {data.robot_model_id} 不存在")
+    if data.scene_id not in valid_scenes:
+        errors.append(f"场景ID {data.scene_id} 不存在")
+    if data.skill_id not in valid_skills:
+        errors.append(f"技能ID {data.skill_id} 不存在")
+    return errors
+
+
+@dataclass
+class IngestOutcome:
+    """单条幂等接入的结果：stored / replayed / conflict / invalid / failed。"""
+
+    status: str
+    body: Optional[dict] = None
+    error: Optional[str] = None
+
+
+def _persist_operation_and_record(
+    db: Session, payload: dict, key: str, payload_hash: str,
+    policy: idem.IdempotencyPolicy, now
+) -> dict:
+    """业务数据与幂等记录在同一事务中落库，返回保存的完整结果。"""
+    operation = OperationData(**payload)
+    db.add(operation)
+    db.flush()
+    db.refresh(operation)
+    body = OperationDataResponse.model_validate(operation).model_dump(mode="json")
+    db.add(idem.build_record(
+        scope=idem.OPERATION_CREATE_SCOPE,
+        key=key,
+        payload_hash=payload_hash,
+        response_body=body,
+        operation_data_id=operation.id,
+        policy=policy,
+        now=now,
+    ))
+    return body
+
+
+def _ingest_with_idempotency(
+    db: Session,
+    data: OperationDataCreate,
+    policy: idem.IdempotencyPolicy,
+    validate: Callable[[], List[str]],
+) -> IngestOutcome:
+    """统一的幂等接入语义，单条与批量入口共用。
+
+    首次请求保存完整结果；相同键与相同载荷重放原结果；载荷不同判冲突；
+    过期键回收后按新请求处理，且旧载荷不会误命中新数据。
+    """
+    key = data.idempotency_key
+    payload = data.model_dump(exclude={"idempotency_key"})
+    payload_hash = idem.fingerprint_payload(data.model_dump(mode="json", exclude={"idempotency_key"}))
+
+    with idem.write_lock:
+        now = idem.utcnow()
+        record = idem.find_record(db, idem.OPERATION_CREATE_SCOPE, key)
+        decision = idem.decide(
+            record.payload_hash if record else None,
+            record.expires_at if record else None,
+            payload_hash,
+            now,
+            policy,
+        )
+
+        if decision == idem.IdempotencyDecision.REPLAY:
+            idem.register_replay(db, record)
+            db.commit()
+            return IngestOutcome("replayed", body=record.response_body)
+
+        if decision == idem.IdempotencyDecision.CONFLICT:
+            idem.register_conflict(db, record)
+            db.commit()
+            return IngestOutcome("conflict", error=f"幂等键 '{key}' 已关联不同的请求载荷")
+
+        errors = validate()
+        if errors:
+            return IngestOutcome("invalid", error="; ".join(errors))
+
+        try:
+            if decision == idem.IdempotencyDecision.RECLAIM:
+                db.delete(record)
+            body = _persist_operation_and_record(db, payload, key, payload_hash, policy, now)
+            db.commit()
+            return IngestOutcome("stored", body=body)
+        except IntegrityError:
+            # 并发写入方已抢先占用该业务键（进程内写锁之外的兜底），按已存记录判定
+            db.rollback()
+            record = idem.find_record(db, idem.OPERATION_CREATE_SCOPE, key)
+            if record is None:
+                return IngestOutcome("failed", error="幂等记录写入冲突，请重试")
+            if record.payload_hash == payload_hash:
+                idem.register_replay(db, record)
+                db.commit()
+                return IngestOutcome("replayed", body=record.response_body)
+            idem.register_conflict(db, record)
+            db.commit()
+            return IngestOutcome("conflict", error=f"幂等键 '{key}' 已关联不同的请求载荷")
 
 
 @router.get("/operations", response_model=OperationDataListResponse, tags=["作业数据"])
@@ -74,22 +199,28 @@ def get_operation_data(operation_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/operations", response_model=OperationDataResponse, tags=["作业数据"])
-def create_operation_data(data: OperationDataCreate, db: Session = Depends(get_db)):
-    robot_model = db.query(RobotModel).filter(RobotModel.id == data.robot_model_id).first()
-    if not robot_model:
-        raise HTTPException(status_code=400, detail="机型不存在")
-    scene = db.query(Scene).filter(Scene.id == data.scene_id).first()
-    if not scene:
-        raise HTTPException(status_code=400, detail="场景不存在")
-    skill = db.query(Skill).filter(Skill.id == data.skill_id).first()
-    if not skill:
-        raise HTTPException(status_code=400, detail="技能不存在")
+def create_operation_data(data: OperationDataCreate, response: Response, db: Session = Depends(get_db)):
+    if not data.idempotency_key:
+        errors = _single_ref_errors(db, data)
+        if errors:
+            raise HTTPException(status_code=400, detail="; ".join(errors))
+        operation = OperationData(**data.model_dump(exclude={"idempotency_key"}))
+        db.add(operation)
+        db.commit()
+        db.refresh(operation)
+        return operation
 
-    operation = OperationData(**data.model_dump())
-    db.add(operation)
-    db.commit()
-    db.refresh(operation)
-    return operation
+    outcome = _ingest_with_idempotency(
+        db, data, _idempotency_policy(), lambda: _single_ref_errors(db, data)
+    )
+    if outcome.status == "invalid":
+        raise HTTPException(status_code=400, detail=outcome.error)
+    if outcome.status == "conflict":
+        raise HTTPException(status_code=409, detail=outcome.error)
+    if outcome.status == "failed":
+        raise HTTPException(status_code=500, detail=outcome.error)
+    response.headers["X-Idempotency-Status"] = outcome.status
+    return outcome.body
 
 
 @router.post("/operations/batch", response_model=BatchOperationResponse, tags=["作业数据"])
@@ -113,15 +244,32 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
         s.id for s in db.query(Skill).filter(Skill.id.in_(skill_ids)).all()
     }
 
-    for index, data in enumerate(data_list):
-        errors = []
-        if data.robot_model_id not in valid_robot_models:
-            errors.append(f"机型ID {data.robot_model_id} 不存在")
-        if data.scene_id not in valid_scenes:
-            errors.append(f"场景ID {data.scene_id} 不存在")
-        if data.skill_id not in valid_skills:
-            errors.append(f"技能ID {data.skill_id} 不存在")
+    policy = _idempotency_policy()
 
+    for index, data in enumerate(data_list):
+        if data.idempotency_key:
+            outcome = _ingest_with_idempotency(
+                db, data, policy,
+                lambda data=data: _batch_ref_errors(data, valid_robot_models, valid_scenes, valid_skills)
+            )
+            if outcome.status in ("stored", "replayed"):
+                success_count += 1
+                results.append(BatchOperationResultItem(
+                    index=index,
+                    success=True,
+                    data=outcome.body,
+                    replayed=(outcome.status == "replayed")
+                ))
+            else:
+                failure_count += 1
+                results.append(BatchOperationResultItem(
+                    index=index,
+                    success=False,
+                    error=outcome.error
+                ))
+            continue
+
+        errors = _batch_ref_errors(data, valid_robot_models, valid_scenes, valid_skills)
         if errors:
             failure_count += 1
             results.append(BatchOperationResultItem(
@@ -132,7 +280,7 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
             continue
 
         try:
-            operation = OperationData(**data.model_dump())
+            operation = OperationData(**data.model_dump(exclude={"idempotency_key"}))
             db.add(operation)
             db.flush()
             db.refresh(operation)

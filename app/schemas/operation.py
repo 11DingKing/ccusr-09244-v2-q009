@@ -22,7 +22,10 @@ class OperationDataBase(BaseModel):
 
 
 class OperationDataCreate(OperationDataBase):
-    pass
+    idempotency_key: Optional[str] = Field(
+        None, max_length=200,
+        description="调用方业务键：携带后启用幂等接入，相同键与相同载荷重放首次结果，载荷不同判冲突"
+    )
 
 
 class OperationDataUpdate(BaseModel):
@@ -78,6 +81,7 @@ class BatchOperationResultItem(BaseModel):
     success: bool
     data: Optional[OperationDataResponse] = None
     error: Optional[str] = None
+    replayed: bool = False
 
 
 class BatchOperationResponse(BaseModel):
